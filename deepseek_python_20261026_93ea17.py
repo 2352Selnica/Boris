@@ -5,11 +5,10 @@ import re
 import io
 from datetime import datetime
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font
 
 st.set_page_config(page_title="MDR pregled dokumentacije", layout="wide")
 st.title("MDR pregled dokumentacije – kataloške številke in certifikati")
-st.caption("Naložite Excel preglednico in mapo PDF. Aplikacija bo preverila, kateri dokument vsebuje katero kataloško številko, in označila manjkajoče ter potekle certifikate.")
+st.caption("Naložite Excel preglednico in mapo PDF. Aplikacija bo preverila, kateri dokument vsebuje katero kataloško številko, in izpisala zahtevane podatke.")
 
 # ---------- 1. Nalaganje vhodnih podatkov ----------
 col1, col2 = st.columns(2)
@@ -22,29 +21,44 @@ with col2:
         accept_multiple_files=True,
     )
 
-# ---------- 2. Branje Excela ----------
+# ---------- 2. Seznam zahtevanih stolpcev ----------
+ZAHTEVANI_STOLPCI = [
+    "PONUDNIK",
+    "PROIZVAJALEC",
+    "PARALELA",
+    "KATALOŠKA",
+    "Razred",
+    "CE št. organa",
+    "Organ",
+    "Št. certifikata",
+    "Veljavnost certifikata",
+    "Veljavnost po letter of confirmation",
+    "Št. DoC",
+]
+
+# ---------- 3. Branje Excela ----------
 def preberi_excel(file):
     wb = load_workbook(file, data_only=True)
-    ws = wb.active  # privzeto prvi list; po potrebi spremenite
-    # Poišči vrstico glave (vsebuje "KATALOŠKA")
+    ws = wb.active
+    # Poišči vrstico glave
     glava_vrstica = None
-    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True), start=1):
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True), start=1):
         if row and any(isinstance(c, str) and "KATALOŠKA" in c.upper() for c in row):
             glava_vrstica = i
             break
     if glava_vrstica is None:
         st.error("V preglednici ni bilo mogoče najti vrstice glave s stolpcem 'KATALOŠKA'.")
-        return None, None
-    glava = [c for c in next(ws.iter_rows(min_row=glava_vrstica, max_row=glava_vrstica, values_only=True))]
+        return None
+
+    glava = list(next(ws.iter_rows(min_row=glava_vrstica, max_row=glava_vrstica, values_only=True)))
     podatki = []
     for row in ws.iter_rows(min_row=glava_vrstica + 1, values_only=True):
         if not any(row):
             continue
         podatki.append(dict(zip(glava, row)))
-    df = pd.DataFrame(podatki)
-    return df, glava_vrstica
+    return pd.DataFrame(podatki)
 
-# ---------- 3. Izluščanje besedila iz PDF ----------
+# ---------- 4. Izluščanje besedila iz PDF ----------
 def izlusci_besedilo(pdf_file):
     besedilo = []
     try:
@@ -56,20 +70,18 @@ def izlusci_besedilo(pdf_file):
         return "", f"Napaka pri branju: {e}"
     return "\n".join(besedilo), None
 
-# ---------- 4. Iskanje kataloške številke v besedilu ----------
+# ---------- 5. Iskanje kataloške številke v besedilu ----------
 def najdi_katalosko(besedilo, kataloska):
     if not isinstance(kataloska, str) or not kataloska.strip():
         return False
     k = kataloska.strip()
-    # 1) neposredno iskanje (brez regularnih izrazov)
     if k.lower() in besedilo.lower():
         return True
-    # 2) iskanje brez presledkov (npr. "MDR 766495" → "MDR766495")
     if re.sub(r"\s+", "", k).lower() in re.sub(r"\s+", "", besedilo).lower():
         return True
     return False
 
-# ---------- 5. Preverjanje veljavnosti ----------
+# ---------- 6. Preverjanje veljavnosti ----------
 def je_poteklo(datum):
     if datum is None or (isinstance(datum, float) and pd.isna(datum)):
         return False
@@ -83,16 +95,20 @@ def je_poteklo(datum):
                 continue
     return False
 
-# ---------- 6. Glavna logika ----------
+# ---------- 7. Glavna logika ----------
 if excel_file and pdf_files:
-    df, glava_vrstica = preberi_excel(excel_file)
+    df = preberi_excel(excel_file)
     if df is None:
         st.stop()
 
-    # Preveri, ali obstaja stolpec KATALOŠKA
     if "KATALOŠKA" not in df.columns:
         st.error("V preglednici ni stolpca 'KATALOŠKA'.")
         st.stop()
+
+    # Preveri, kateri od zahtevanih stolpcev manjkajo
+    manjkajoci = [s for s in ZAHTEVANI_STOLPCI if s not in df.columns]
+    if manjkajoci:
+        st.warning(f"V preglednici manjkajo naslednji stolpci: {', '.join(manjkajoci)}. Ti bodo v rezultatih prazni.")
 
     st.success(f"Prebrana preglednica: {len(df)} vrstic, {len(pdf_files)} PDF datotek.")
 
@@ -122,21 +138,18 @@ if excel_file and pdf_files:
             for ime, besedilo in pdf_besedila.items():
                 if najdi_katalosko(besedilo, kat):
                     najdene.append(ime)
-            # Preveri veljavnost
+
             veljavnost = vrstica.get("Veljavnost certifikata")
             poteklo = je_poteklo(veljavnost)
-            rezultati.append({
-                "Kataloška": kat,
-                "Naziv": vrstica.get("NAZIV", ""),
-                "Ponudnik": vrstica.get("PONUDNIK", ""),
-                "Proizvajalec": vrstica.get("PROIZVAJALEC", ""),
-                "Razred": vrstica.get("Razred", ""),
-                "Najdeno v dokumentih": "; ".join(najdene) if najdene else "",
-                "Število zadetkov": len(najdene),
-                "Status": "Najdeno" if najdene else "Ni najdeno",
-                "Veljavnost certifikata": veljavnost,
-                "Poteklo": "DA" if poteklo else "",
-            })
+
+            zapis = {}
+            for s in ZAHTEVANI_STOLPCI:
+                zapis[s] = vrstica.get(s, "")
+            zapis["Najdeno v dokumentih"] = "; ".join(najdene) if najdene else ""
+            zapis["Število zadetkov"] = len(najdene)
+            zapis["Status"] = "Najdeno" if najdene else "Ni najdeno"
+            zapis["Poteklo"] = "DA" if poteklo else ""
+            rezultati.append(zapis)
 
     rez_df = pd.DataFrame(rezultati)
 
@@ -157,11 +170,7 @@ if excel_file and pdf_files:
             return ["background-color: #fff3cd"] * len(vrstica)
         return ["background-color: #d4edda"] * len(vrstica)
 
-    st.dataframe(
-        rez_df.style.apply(obarvaj, axis=1),
-        use_container_width=True,
-        height=600,
-    )
+    st.dataframe(rez_df.style.apply(obarvaj, axis=1), use_container_width=True, height=600)
 
     # Izvoz
     st.subheader("Izvoz rezultatov")
@@ -176,7 +185,6 @@ if excel_file and pdf_files:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # Podrobnosti o dokumentih
     with st.expander("Seznam naloženih PDF in njihova dolžina besedila"):
         for ime, besedilo in pdf_besedila.items():
             st.write(f"**{ime}** – {len(besedilo)} znakov")
