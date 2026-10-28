@@ -12,14 +12,58 @@ try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
+
 try:
     import docx  # python-docx
 except ImportError:
     docx = None
 
+# --- OCR ---
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    pytesseract = None
+    Image = None
+    OCR_AVAILABLE = False
+
+try:
+    from pdf2image import convert_from_bytes
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    convert_from_bytes = None
+    PDF2IMAGE_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
-# 1. Pomožne funkcije
+# 0. Konfiguracija OCR
+# ---------------------------------------------------------------------------
+
+def configure_tesseract():
+    """
+    Na lokalnih sistemih je včasih treba nastaviti pot do tesseract.exe.
+    V oblaku (Streamlit Cloud, Linux) je tesseract v PATH in to ni potrebno.
+    """
+    import os
+    import platform
+    if pytesseract is None:
+        return
+    if platform.system() == "Windows":
+        for path in [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
+
+
+configure_tesseract()
+
+
+# ---------------------------------------------------------------------------
+# 1. Pomožne funkcije (nespremenjene)
 # ---------------------------------------------------------------------------
 
 STATUS_COLORS = {
@@ -64,21 +108,70 @@ def get_max_transition_date(razred):
 
 
 # ---------------------------------------------------------------------------
-# 2. Branje naloženih dokumentov in iskanje kataloških številk
+# 2. Branje dokumentov z OCR podporo
 # ---------------------------------------------------------------------------
 
-def read_pdf_text(file_bytes):
+def read_pdf_text_native(file_bytes, max_pages=30):
+    """Branje PDF prek pdfplumber (besedilni sloj)."""
     if pdfplumber is None:
         return ""
     text = []
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages[:30]:  # omejitev na 30 strani
+            for page in pdf.pages[:max_pages]:
                 t = page.extract_text() or ""
                 text.append(t)
     except Exception:
         pass
     return "\n".join(text)
+
+
+def read_pdf_with_ocr(file_bytes, lang="slv+eng", dpi=300, max_pages=10):
+    """OCR nad PDF prek pdf2image + pytesseract."""
+    if not (OCR_AVAILABLE and PDF2IMAGE_AVAILABLE):
+        return ""
+    try:
+        images = convert_from_bytes(file_bytes, dpi=dpi, first_page=1, last_page=max_pages)
+    except Exception:
+        return ""
+    parts = []
+    for img in images:
+        try:
+            parts.append(pytesseract.image_to_string(img, lang=lang))
+        except Exception:
+            continue
+    return "\n".join(parts)
+
+
+def read_pdf_text(file_bytes, use_ocr=True, ocr_lang="slv+eng", ocr_dpi=300):
+    """
+    Hibridno branje PDF-ja:
+    1. Najprej poskusi pdfplumber.
+    2. Če vrne premalo besedila (<50 znakov na stran) in je OCR na voljo,
+       preklopi na OCR.
+    """
+    native = read_pdf_text_native(file_bytes)
+    if not use_ocr or not OCR_AVAILABLE or not PDF2IMAGE_AVAILABLE:
+        return native
+
+    # Če je besedila premalo, uporabi OCR
+    if len(native.strip()) < 100:
+        ocr = read_pdf_with_ocr(file_bytes, lang=ocr_lang, dpi=ocr_dpi)
+        if len(ocr.strip()) > len(native.strip()):
+            return ocr
+    return native
+
+
+def read_image_with_ocr(file_bytes, lang="slv+eng"):
+    if not OCR_AVAILABLE:
+        return ""
+    try:
+        img = Image.open(BytesIO(file_bytes))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        return pytesseract.image_to_string(img, lang=lang)
+    except Exception:
+        return ""
 
 
 def read_docx_text(file_bytes):
@@ -103,32 +196,33 @@ def read_txt_text(file_bytes):
         return ""
 
 
-def extract_text(file_name, file_bytes):
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif")
+
+
+def extract_text(file_name, file_bytes, use_ocr=True, ocr_lang="slv+eng", ocr_dpi=300):
     name = file_name.lower()
     if name.endswith(".pdf"):
-        return read_pdf_text(file_bytes)
+        return read_pdf_text(file_bytes, use_ocr=use_ocr, ocr_lang=ocr_lang, ocr_dpi=ocr_dpi)
     if name.endswith(".docx"):
         return read_docx_text(file_bytes)
     if name.endswith(".txt"):
         return read_txt_text(file_bytes)
+    if name.endswith(IMAGE_EXTS):
+        return read_image_with_ocr(file_bytes, lang=ocr_lang)
     return ""
 
 
 def classify_document_type(file_name):
-    """Razvrsti dokument glede na ime datoteke."""
     n = file_name.lower()
-    # LoC / potrditveno pismo priglašenega organa
     if any(k in n for k in ["loc", "letter of confirmation", "confirmation letter",
                              "nb letter", "nb_confirmation", "notified body",
                              "confirmation_letter", "confirmation-letter",
                              "podaljš", "extension"]):
         return "LoC"
-    # Certifikat
     if any(k in n for k in ["ce ", "ce_", "_ce", "ec certificate", "ec_certificate",
                              "certifikat", "certificate", "mdr cert", "mdr_cert",
                              "ec cert", "ec_cert"]):
         return "Certifikat"
-    # DoC
     if any(k in n for k in ["doc", "declaration of conformity", "declaration_of_conformity",
                              "izjava o skladnosti", "izjava_o_skladnosti",
                              "declaration-of-conformity"]):
@@ -137,31 +231,25 @@ def classify_document_type(file_name):
 
 
 def find_idents_in_text(text, idents):
-    """V besedilu poišče vse kataloške številke iz seznama idents."""
     if not text:
         return []
     found = set()
-    # Iskanje po celotnih nizih (celotna kataloška številka)
     for ident in idents:
         s = str(ident).strip()
         if not s or len(s) < 4:
             continue
-        # Uporabi meje besed, da ne ujamemo delnih številk
-        pattern = r"(?<!\d)" + re.escape(s) + r"(?!\d)"
+        # Dovoli presledke med številkami (npr. "967 917")
+        pattern = r"(?<!\d)" + r"\s*".join(map(re.escape, s)) + r"(?!\d)"
         if re.search(pattern, text):
             found.add(s)
     return sorted(found)
 
 
 # ---------------------------------------------------------------------------
-# 3. Verižno preverjanje (ena vrstica)
+# 3. Verižno preverjanje (nespremenjeno)
 # ---------------------------------------------------------------------------
 
 def classify_row(row, dokumentacija_df, uploaded_index, today=None):
-    """
-    uploaded_index: dict z ključi 'DoC', 'Certifikat', 'LoC', vsak vsebuje
-    seznam dict-ov z {'file_name': ..., 'idents': [...]}.
-    """
     if today is None:
         today = datetime.today()
 
@@ -187,7 +275,6 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
     veljavnost_loc = parse_date(row.get("Veljavnost po letter of confirmation"))
     razred_str = str(razred).strip() if not pd.isna(razred) else ""
 
-    # Naloženi dokumenti, ki vsebujejo to kataloško številko
     def _uploaded_names(kind):
         names = []
         for d in uploaded_index.get(kind, []):
@@ -202,7 +289,6 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
     result["Nalozen_Certifikat"] = nal_cert
     result["Nalozen_LoC"] = nal_loc
 
-    # ---- Razred I brez certifikata --------------------------------------
     if razred_str.lower() in ("i", "im", "is", "is+m", "ims"):
         opomba = str(row.get("Opomba", "")).lower()
         if "certifikat ni potreben" in opomba or "certifikat ni potrben" in opomba:
@@ -220,7 +306,6 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
                 )
             return result
 
-    # ---- Korak 1: DoC ---------------------------------------------------
     if not nal_doс:
         result.update(
             Status_izracun="Nepopolno",
@@ -231,9 +316,7 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
 
     result["Korak_DoC"] = "naložen in vsebuje kataloško št."
 
-    # ---- Korak 2: številka certifikata ---------------------------------
     cert_number = str(st_cert).strip() if not pd.isna(st_cert) else None
-
     if not cert_number:
         if "certifikat ni potreben" in str(row.get("Opomba", "")).lower():
             result.update(
@@ -249,7 +332,6 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
             )
         return result
 
-    # ---- Korak 3: veljavnost certifikata -------------------------------
     if veljavnost_cert is None:
         result.update(
             Status_izracun="Nepopolno",
@@ -259,7 +341,6 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
         return result
 
     if veljavnost_cert >= today:
-        # Preveri, ali je certifikat sploh naložen
         if nal_cert:
             result.update(
                 Status_izracun="Popolno",
@@ -274,7 +355,6 @@ def classify_row(row, dokumentacija_df, uploaded_index, today=None):
             )
         return result
 
-    # ---- Korak 4: potekel – preveri LoC --------------------------------
     result["Korak_Certifikat"] = f"POTEKEL ({veljavnost_cert.date()})"
 
     max_transition = get_max_transition_date(razred)
@@ -397,6 +477,23 @@ st.set_page_config(page_title="Preverjanje certifikatov", layout="wide")
 st.title("🔍 Samodejno preverjanje dokumentacije medicinskih pripomočkov")
 st.caption("Verižno preverjanje: DoC → certifikat → veljavnost → Confirmation Letter (LoC)")
 
+# --- Stranska vrstica: OCR nastavitve -------------------------------------
+with st.sidebar:
+    st.header("⚙️ Nastavitve OCR")
+    if OCR_AVAILABLE:
+        st.success("pytesseract je na voljo.")
+    else:
+        st.warning("pytesseract ni nameščen – OCR ne bo deloval.")
+    if PDF2IMAGE_AVAILABLE:
+        st.success("pdf2image je na voljo.")
+    else:
+        st.warning("pdf2image ni nameščen – OCR za PDF ne bo deloval.")
+
+    use_ocr = st.checkbox("Uporabi OCR za skenirane PDF-je in slike", value=True,
+                          disabled=not OCR_AVAILABLE)
+    ocr_lang = st.selectbox("Jezik OCR", ["slv+eng", "eng", "slv"], index=0)
+    ocr_dpi = st.slider("DPI za OCR", min_value=150, max_value=400, value=300, step=50)
+
 # --- Nalaganje Excel datoteke ---------------------------------------------
 st.header("1️⃣ Excel datoteka")
 uploaded_xlsx = st.file_uploader("Naloži Excel datoteko (Certifikati_preverjeno.xlsx)", type=["xlsx"])
@@ -404,12 +501,12 @@ uploaded_xlsx = st.file_uploader("Naloži Excel datoteko (Certifikati_preverjeno
 # --- Nalaganje dokumentov --------------------------------------------------
 st.header("2️⃣ Dokumenti (DoC, certifikati, LoC)")
 st.write(
-    "Naložite PDF, DOCX ali TXT datoteke. Aplikacija bo v vsebini poiskala "
-    "kataloške številke in jih povezala z vrsticami v Excelu."
+    "Naložite PDF, DOCX, TXT ali slike (PNG/JPG/TIF). Aplikacija bo v vsebini "
+    "poiskala kataloške številke in jih povezala z vrsticami v Excelu."
 )
 uploaded_docs = st.file_uploader(
     "Naloži dokumente (lahko več hkrati)",
-    type=["pdf", "docx", "txt"],
+    type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "tif", "tiff", "bmp"],
     accept_multiple_files=True,
 )
 
@@ -423,7 +520,6 @@ if uploaded_xlsx and uploaded_docs:
         else pd.DataFrame()
     )
 
-    # Seznam vseh kataloških številk iz Excela
     idents = df_r067["IDENT"].dropna().astype(str).str.strip().unique().tolist()
 
     col1, col2, col3 = st.columns(3)
@@ -437,10 +533,17 @@ if uploaded_xlsx and uploaded_docs:
         progress = st.progress(0, text="Berem naložene dokumente ...")
         for i, doc in enumerate(uploaded_docs):
             file_bytes = doc.read()
-            text = extract_text(doc.name, file_bytes)
+            text = extract_text(
+                doc.name, file_bytes,
+                use_ocr=use_ocr, ocr_lang=ocr_lang, ocr_dpi=ocr_dpi,
+            )
             found = find_idents_in_text(text, idents)
             kind = classify_document_type(doc.name)
-            uploaded_index[kind].append({"file_name": doc.name, "idents": found})
+            uploaded_index[kind].append({
+                "file_name": doc.name,
+                "idents": found,
+                "ocr_used": (use_ocr and len(text) > 0),
+            })
             progress.progress((i + 1) / len(uploaded_docs),
                               text=f"Berem {doc.name} ({i+1}/{len(uploaded_docs)})")
         progress.empty()
